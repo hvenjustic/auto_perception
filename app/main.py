@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 from fastapi import FastAPI, HTTPException, Query
+import uvicorn
 
 from app.env_loader import load_env_file
 from app.models import (
@@ -104,3 +105,9 @@ def get_change(change_id: str):
     if data is None:
         raise HTTPException(status_code=404, detail="change_id 不存在")
     return data
+
+
+if __name__ == "__main__":
+    host = os.getenv("APP_HOST", "0.0.0.0")
+    port = int(os.getenv("APP_PORT", "8000"))
+    uvicorn.run("app.main:app", host=host, port=port, reload=False)

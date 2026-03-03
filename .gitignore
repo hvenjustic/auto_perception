@@ -5,5 +5,5 @@ data/
 *.db
 *.db-shm
 *.db-wal
-
+.idea
 config/runtime.env
