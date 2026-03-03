@@ -117,12 +117,27 @@ class ResultChangeItem(BaseModel):
 
 
 class ScanResultResponse(BaseModel):
+    task_id: str | None = None
     task_start_time: str | None = None
     task_end_time: str | None = None
     monitor_count: int = 0
     detected_count: int = 0
     pending_count: int = 0
     changes: list[ResultChangeItem] = Field(default_factory=list)
+
+
+class ScanTaskStatusResponse(BaseModel):
+    task_id: str | None = None
+    status: str = Field(default="idle", description="idle/running/completed/stopped/failed")
+    task_start_time: str | None = None
+    task_end_time: str | None = None
+    elapsed_seconds: int = 0
+    monitor_count: int = 0
+    detected_count: int = 0
+    pending_count: int = 0
+    progress: float = 0.0
+    stop_requested: bool = False
+    message: str | None = None
 
 
 class PersistedState(BaseModel):

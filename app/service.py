@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -16,7 +18,7 @@ from app.models import (
     ResultChangeItem,
     RunScanRequest,
     ScanResultResponse,
-    RunScanResponse,
+    ScanTaskStatusResponse,
     SiteConfig,
     SiteRuntimeState,
     utc_now_iso,
@@ -31,6 +33,12 @@ class AutoPerceptionService:
         self.store = store
         self.monitor = WebsiteMonitor()
         self.summarizer = ChangeSummarizer()
+        self._task_lock = threading.Lock()
+        self._scan_running = False
+        self._stop_requested = False
+        self._current_task_id: str | None = None
+        self._last_status = "idle"
+        self._last_message = "暂无运行中的扫描任务"
 
     def import_sites(self, request: ImportSitesRequest) -> ImportSitesResponse:
         state = self.store.load()
@@ -115,18 +123,56 @@ class AutoPerceptionService:
 
     def get_latest_result(self) -> ScanResultResponse:
         state = self.store.load()
-        raw = state.meta.get("latest_result")
-        if not isinstance(raw, dict):
-            return ScanResultResponse()
-        try:
-            return ScanResultResponse.model_validate(raw)
-        except ValueError:
-            return ScanResultResponse()
+        return self._load_latest_result(state)
 
-    async def run_scan(self, request: RunScanRequest) -> RunScanResponse:
+    def get_scan_status(self) -> ScanTaskStatusResponse:
+        state = self.store.load()
+        latest = self._load_latest_result(state)
+        with self._task_lock:
+            running = self._scan_running
+            stop_requested = self._stop_requested
+            current_task_id = self._current_task_id
+            status = "running" if running else self._last_status
+            message = self._last_message
+
+        elapsed = self._calc_elapsed_seconds(
+            latest.task_start_time,
+            None if running else latest.task_end_time,
+        )
+        progress = self._calc_progress(latest.monitor_count, latest.detected_count)
+        return ScanTaskStatusResponse(
+            task_id=current_task_id or latest.task_id,
+            status=status,
+            task_start_time=latest.task_start_time,
+            task_end_time=latest.task_end_time,
+            elapsed_seconds=elapsed,
+            monitor_count=latest.monitor_count,
+            detected_count=latest.detected_count,
+            pending_count=latest.pending_count,
+            progress=progress,
+            stop_requested=stop_requested,
+            message=message,
+        )
+
+    async def start_scan(self, request: RunScanRequest) -> ScanTaskStatusResponse:
+        already_running = False
+        with self._task_lock:
+            if self._scan_running:
+                already_running = True
+            else:
+                task_id = uuid.uuid4().hex
+                self._scan_running = True
+                self._stop_requested = False
+                self._current_task_id = task_id
+                self._last_status = "running"
+                self._last_message = "扫描任务已启动"
+        if already_running:
+            return self.get_scan_status()
+
         state = self.store.load()
         site_ids = self._resolve_scan_site_ids(request, state)
         scan_result = ScanResultResponse(
+            task_id=task_id,
             task_start_time=utc_now_iso(),
             task_end_time=None,
             monitor_count=len(site_ids),
@@ -136,79 +182,129 @@ class AutoPerceptionService:
         )
         state.meta["latest_result"] = scan_result.model_dump(mode="json")
         self.store.save(state)
+        asyncio.create_task(self._run_scan_task(task_id, site_ids))
+        return self.get_scan_status()
 
+    def stop_scan(self) -> ScanTaskStatusResponse:
+        with self._task_lock:
+            if not self._scan_running:
+                raise ValueError("当前没有运行中的扫描任务")
+            self._stop_requested = True
+            self._last_message = "已收到停止请求，正在结束当前扫描任务"
+        return self.get_scan_status()
+
+    async def _run_scan_task(self, task_id: str, site_ids: list[str]) -> None:
+        stopped = False
         if not site_ids:
+            state = self.store.load()
+            scan_result = self._load_latest_result(state)
             scan_result.task_end_time = utc_now_iso()
             scan_result.pending_count = 0
             state.meta["latest_result"] = scan_result.model_dump(mode="json")
             self.store.save(state)
-            return RunScanResponse(scanned_site_ids=[], changes=[])
+            self._finish_task(task_id, "completed", "任务完成：没有可扫描站点")
+            return
 
-        all_changes: list[DetectedChange] = []
-        async with httpx.AsyncClient() as client:
-            for site_id in site_ids:
-                site = state.sites[site_id]
-                runtime = state.runtime.get(site_id, SiteRuntimeState())
-                first_scan = runtime.last_scan_at is None
+        try:
+            async with httpx.AsyncClient() as client:
+                for site_id in site_ids:
+                    if self._should_stop(task_id):
+                        stopped = True
+                        break
 
-                layer1 = await self.monitor.layer1(client, site, runtime)
-                candidates = set(layer1.candidate_urls)
-                if not candidates:
-                    candidates.add(site.url)
-
-                layer2 = await self.monitor.layer2(client, site, runtime, candidates)
-
-                runtime.rss_items = layer1.rss_items
-                runtime.sitemap_lastmod = layer1.sitemap_lastmod
-                runtime.index_hash = layer1.index_hash
-                runtime.page_hashes = layer2.page_hashes
-                runtime.page_snapshots = layer2.page_snapshots
-                runtime.last_scan_at = datetime.now(timezone.utc).isoformat()
-                state.runtime[site_id] = runtime
-
-                for page_change in layer2.changes:
-                    if first_scan and page_change.old_hash is None:
+                    state = self.store.load()
+                    site = state.sites.get(site_id)
+                    if site is None or not site.enabled:
+                        scan_result = self._load_latest_result(state)
+                        scan_result.detected_count += 1
+                        scan_result.pending_count = max(
+                            0, scan_result.monitor_count - scan_result.detected_count
+                        )
+                        state.meta["latest_result"] = scan_result.model_dump(mode="json")
+                        self.store.save(state)
                         continue
-                    summary = await self.summarizer.summarize(
-                        page_url=page_change.page_url,
-                        old_text=page_change.old_text,
-                        new_text=page_change.new_text,
-                    )
-                    detected = DetectedChange(
-                        change_id=uuid.uuid4().hex,
-                        site_id=site_id,
-                        site_name=site.name,
-                        page_url=page_change.page_url,
-                        layer="layer3_summary",
-                        change_type=page_change.change_type,
-                        old_hash=page_change.old_hash,
-                        new_hash=page_change.new_hash,
-                        summary=summary,
-                        signals=layer1.signals[:10],
-                    )
-                    all_changes.append(detected)
-                    scan_result.changes.append(
-                        ResultChangeItem(url=detected.page_url, summary=detected.summary)
-                    )
 
-                scan_result.detected_count += 1
-                scan_result.pending_count = max(
-                    0, scan_result.monitor_count - scan_result.detected_count
-                )
-                state.meta["latest_result"] = scan_result.model_dump(mode="json")
-                self.store.save(state)
+                    runtime = state.runtime.get(site_id, SiteRuntimeState())
+                    first_scan = runtime.last_scan_at is None
 
-        if all_changes:
-            state.changes = all_changes + state.changes
-            state.changes = state.changes[:5000]
-        scan_result.task_end_time = utc_now_iso()
-        scan_result.pending_count = max(
-            0, scan_result.monitor_count - scan_result.detected_count
-        )
-        state.meta["latest_result"] = scan_result.model_dump(mode="json")
-        self.store.save(state)
+                    layer1 = await self.monitor.layer1(client, site, runtime)
+                    candidates = set(layer1.candidate_urls)
+                    if not candidates:
+                        candidates.add(site.url)
 
-        return RunScanResponse(scanned_site_ids=site_ids, changes=all_changes)
+                    layer2 = await self.monitor.layer2(client, site, runtime, candidates)
+
+                    runtime.rss_items = layer1.rss_items
+                    runtime.sitemap_lastmod = layer1.sitemap_lastmod
+                    runtime.index_hash = layer1.index_hash
+                    runtime.page_hashes = layer2.page_hashes
+                    runtime.page_snapshots = layer2.page_snapshots
+                    runtime.last_scan_at = datetime.now(timezone.utc).isoformat()
+                    state.runtime[site_id] = runtime
+
+                    new_changes: list[DetectedChange] = []
+                    scan_result = self._load_latest_result(state)
+                    for page_change in layer2.changes:
+                        if self._should_stop(task_id):
+                            stopped = True
+                            break
+                        if first_scan and page_change.old_hash is None:
+                            continue
+                        summary = await self.summarizer.summarize(
+                            page_url=page_change.page_url,
+                            old_text=page_change.old_text,
+                            new_text=page_change.new_text,
+                        )
+                        detected = DetectedChange(
+                            change_id=uuid.uuid4().hex,
+                            site_id=site_id,
+                            site_name=site.name,
+                            page_url=page_change.page_url,
+                            layer="layer3_summary",
+                            change_type=page_change.change_type,
+                            old_hash=page_change.old_hash,
+                            new_hash=page_change.new_hash,
+                            summary=summary,
+                            signals=layer1.signals[:10],
+                        )
+                        new_changes.append(detected)
+                        scan_result.changes.append(
+                            ResultChangeItem(url=detected.page_url, summary=detected.summary)
+                        )
+
+                    if new_changes:
+                        state.changes = new_changes + state.changes
+                        state.changes = state.changes[:5000]
+
+                    scan_result.detected_count += 1
+                    scan_result.pending_count = max(
+                        0, scan_result.monitor_count - scan_result.detected_count
+                    )
+                    state.meta["latest_result"] = scan_result.model_dump(mode="json")
+                    self.store.save(state)
+
+                    if stopped:
+                        break
+
+            state = self.store.load()
+            scan_result = self._load_latest_result(state)
+            scan_result.task_end_time = utc_now_iso()
+            scan_result.pending_count = max(
+                0, scan_result.monitor_count - scan_result.detected_count
+            )
+            state.meta["latest_result"] = scan_result.model_dump(mode="json")
+            self.store.save(state)
+            if stopped:
+                self._finish_task(task_id, "stopped", "任务已停止，已保留已扫描结果")
+            else:
+                self._finish_task(task_id, "completed", "任务已完成")
+        except Exception as exc:
+            state = self.store.load()
+            scan_result = self._load_latest_result(state)
+            scan_result.task_end_time = utc_now_iso()
+            state.meta["latest_result"] = scan_result.model_dump(mode="json")
+            self.store.save(state)
+            self._finish_task(task_id, "failed", f"任务失败: {exc}")
 
     def _resolve_scan_site_ids(
         self, request: RunScanRequest, state: PersistedState
@@ -229,3 +325,53 @@ class AutoPerceptionService:
             candidate = f"{base}_{seq}"
             seq += 1
         return candidate
+
+    def _load_latest_result(self, state: PersistedState) -> ScanResultResponse:
+        raw = state.meta.get("latest_result")
+        if not isinstance(raw, dict):
+            return ScanResultResponse()
+        try:
+            return ScanResultResponse.model_validate(raw)
+        except ValueError:
+            return ScanResultResponse()
+
+    def _finish_task(self, task_id: str, status: str, message: str) -> None:
+        with self._task_lock:
+            if self._current_task_id != task_id:
+                return
+            self._scan_running = False
+            self._stop_requested = False
+            self._last_status = status
+            self._last_message = message
+
+    def _should_stop(self, task_id: str) -> bool:
+        with self._task_lock:
+            return (
+                self._scan_running
+                and self._current_task_id == task_id
+                and self._stop_requested
+            )
+
+    def _calc_elapsed_seconds(self, start_time: str | None, end_time: str | None) -> int:
+        if not start_time:
+            return 0
+        try:
+            start_dt = datetime.fromisoformat(start_time)
+            if end_time:
+                end_dt = datetime.fromisoformat(end_time)
+            else:
+                end_dt = datetime.now(timezone.utc)
+            value = int((end_dt - start_dt).total_seconds())
+            return max(0, value)
+        except ValueError:
+            return 0
+
+    def _calc_progress(self, monitor_count: int, detected_count: int) -> float:
+        if monitor_count <= 0:
+            return 100.0
+        progress = (detected_count / monitor_count) * 100.0
+        if progress < 0:
+            return 0.0
+        if progress > 100:
+            return 100.0
+        return round(progress, 2)

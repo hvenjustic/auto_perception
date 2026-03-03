@@ -13,7 +13,7 @@ from app.models import (
     MonitorUrlListResponse,
     RunScanRequest,
     ScanResultResponse,
-    RunScanResponse,
+    ScanTaskStatusResponse,
     SiteConfig,
 )
 from app.service import AutoPerceptionService
@@ -67,9 +67,22 @@ def delete_monitor_by_url(payload: DeleteMonitorByUrlRequest) -> DeleteMonitorBy
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.post("/api/v1/scan/run", response_model=RunScanResponse)
-async def run_scan(payload: RunScanRequest) -> RunScanResponse:
-    return await service.run_scan(payload)
+@app.post("/api/v1/scan/run", response_model=ScanTaskStatusResponse)
+async def run_scan(payload: RunScanRequest) -> ScanTaskStatusResponse:
+    return await service.start_scan(payload)
+
+
+@app.get("/api/v1/scan/status", response_model=ScanTaskStatusResponse)
+def get_scan_status() -> ScanTaskStatusResponse:
+    return service.get_scan_status()
+
+
+@app.post("/api/v1/scan/stop", response_model=ScanTaskStatusResponse)
+def stop_scan() -> ScanTaskStatusResponse:
+    try:
+        return service.stop_scan()
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/result", response_model=ScanResultResponse)

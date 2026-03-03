@@ -82,29 +82,48 @@
 - 失败：若条目不存在或已删除，返回 404，提示 `条目不存在或已删除`
 
 6. `POST /api/v1/scan/run`
-- 用途：触发扫描
+- 用途：触发扫描任务（单任务互斥）
 - 请求体：
 ```json
 {
   "site_ids": ["demo"]
 }
 ```
-- 说明：`site_ids` 不传时扫描全部已启用站点
-- 返回：本次扫描站点列表 + 本次检测到的变更列表
+- 说明：
+  - `site_ids` 不传时扫描全部已启用站点
+  - 若已有任务运行中，不会重复启动，会直接返回当前任务状态
+- 返回：当前任务状态（进度、开始时间、已运行时间等）
 
-7. `GET /api/v1/changes?site_id=demo&limit=50`
+7. `GET /api/v1/scan/status`
+- 用途：查询当前扫描任务状态
+- 返回字段：
+  - `status`：`idle/running/completed/stopped/failed`
+  - `task_start_time` / `task_end_time`
+  - `elapsed_seconds`
+  - `monitor_count` / `detected_count` / `pending_count`
+  - `progress`
+  - `stop_requested`
+  - `message`
+
+8. `POST /api/v1/scan/stop`
+- 用途：停止当前扫描任务
+- 说明：会保留已扫描结果，不会回滚
+- 失败：若当前无运行任务，返回 409
+
+9. `GET /api/v1/changes?site_id=demo&limit=50`
 - 用途：分页查看历史变更（按时间倒序）
 - 参数：
   - `site_id`：可选，按站点过滤
   - `limit`：可选，默认 50，最大 500
 
-8. `GET /api/v1/changes/{change_id}`
+10. `GET /api/v1/changes/{change_id}`
 - 用途：查看单条变更详情
 - 返回：指定变更记录；不存在返回 404
 
-9. `GET /api/v1/result`
+11. `GET /api/v1/result`
 - 用途：获取最近一次监测任务结果汇总
 - 返回字段：
+  - `task_id`：任务 ID
   - `task_start_time`：任务开始时间
   - `task_end_time`：任务结束时间
   - `monitor_count`：监测数量
@@ -131,7 +150,8 @@ pip install -r requirements.txt
 
 2. 启动服务：
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+source config/runtime.env
+uvicorn app.main:app --host "${APP_HOST:-0.0.0.0}" --port "${APP_PORT:-8000}"
 ```
 
 3. （可选）配置 DeepSeek 摘要能力：
